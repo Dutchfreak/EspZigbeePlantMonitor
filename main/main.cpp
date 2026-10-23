@@ -27,6 +27,8 @@ constexpr uint16_t kTuyaClusterId = 0xEF00;
 constexpr uint8_t kTuyaDataReportCommand = 0x02;
 constexpr TickType_t kDisplayPollInterval = pdMS_TO_TICKS(1000);
 constexpr TickType_t kDisplayMinimumRefreshInterval = pdMS_TO_TICKS(15000);
+constexpr uint32_t kDefaultSensorStaleAfterMinutes = 60;
+constexpr uint32_t kMaximumSensorStaleAfterMinutes = 10080;
 constexpr char kDisplayTag[] = "epaper";
 constexpr char kNameNamespace[] = "zb_names";
 constexpr char kNameRecordsKey[] = "records";
@@ -94,9 +96,11 @@ struct DisplayRow {
     char name[kDeviceNameSize]{};
     uint16_t short_address = EZB_NWK_ADDR_UNKNOWN;
     SensorValues values{};
+    bool stale = false;
 };
 
 struct DisplayLabels {
+    lv_obj_t* row_background[kMaxChildren]{};
     lv_obj_t* device[kMaxChildren]{};
     lv_obj_t* soil[kMaxChildren]{};
     lv_obj_t* air[kMaxChildren]{};
@@ -115,6 +119,8 @@ std::atomic<bool> s_network_ready{false};
 portMUX_TYPE s_devices_mux = portMUX_INITIALIZER_UNLOCKED;
 std::array<DeviceRecord, kMaxKnownDevices> s_devices{};
 std::array<SensorValues, kMaxKnownDevices> s_sensor_values{};
+std::array<int64_t, kMaxKnownDevices> s_last_seen_us{};
+std::atomic<uint32_t> s_sensor_stale_after_minutes{kDefaultSensorStaleAfterMinutes};
 
 enum class RenameStage {
     None,
@@ -157,6 +163,58 @@ void load_device_names()
     portEXIT_CRITICAL(&s_devices_mux);
 }
 
+void load_sensor_timeout()
+{
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open(kNameNamespace, NVS_READONLY, &handle);
+    if (result == ESP_ERR_NVS_NOT_FOUND) {
+        return;
+    }
+    if (result != ESP_OK) {
+        std::printf("Could not open sensor-timeout storage: %s\n", esp_err_to_name(result));
+        return;
+    }
+
+    uint32_t minutes = kDefaultSensorStaleAfterMinutes;
+    result = nvs_get_u32(handle, "stale_minutes", &minutes);
+    nvs_close(handle);
+    if (result == ESP_ERR_NVS_NOT_FOUND) {
+        return;
+    }
+    if (result != ESP_OK) {
+        std::printf("Could not load sensor timeout: %s\n", esp_err_to_name(result));
+        return;
+    }
+    if (minutes < 1 || minutes > kMaximumSensorStaleAfterMinutes) {
+        std::printf("Stored sensor timeout is invalid; using default %u minutes.\n",
+                    static_cast<unsigned>(kDefaultSensorStaleAfterMinutes));
+        return;
+    }
+
+    s_sensor_stale_after_minutes.store(minutes);
+}
+
+bool save_sensor_timeout(uint32_t minutes)
+{
+    nvs_handle_t handle;
+    esp_err_t result = nvs_open(kNameNamespace, NVS_READWRITE, &handle);
+    if (result != ESP_OK) {
+        std::printf("Could not open sensor-timeout storage: %s\n", esp_err_to_name(result));
+        return false;
+    }
+
+    result = nvs_set_u32(handle, "stale_minutes", minutes);
+    if (result == ESP_OK) {
+        result = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    if (result != ESP_OK) {
+        std::printf("Could not save sensor timeout: %s\n", esp_err_to_name(result));
+        return false;
+    }
+    return true;
+}
+
 bool save_device_names()
 {
     PersistedNames names{};
@@ -191,6 +249,9 @@ size_t find_or_add_device(uint64_t ieee_address, uint16_t short_address, bool ac
     portENTER_CRITICAL(&s_devices_mux);
     for (size_t i = 0; i < s_devices.size(); ++i) {
         if (s_devices[i].ieee_address == ieee_address) {
+            if (active && !s_devices[i].active && s_last_seen_us[i] == 0) {
+                s_last_seen_us[i] = esp_timer_get_time();
+            }
             s_devices[i].short_address = short_address;
             s_devices[i].active = active;
             portEXIT_CRITICAL(&s_devices_mux);
@@ -204,6 +265,9 @@ size_t find_or_add_device(uint64_t ieee_address, uint16_t short_address, bool ac
         s_devices[free_slot].ieee_address = ieee_address;
         s_devices[free_slot].short_address = short_address;
         s_devices[free_slot].active = active;
+        if (active) {
+            s_last_seen_us[free_slot] = esp_timer_get_time();
+        }
     }
     portEXIT_CRITICAL(&s_devices_mux);
     return free_slot;
@@ -287,6 +351,9 @@ void store_sensor_value(uint16_t short_address, uint8_t datapoint_id, uint32_t v
         default:
             break;
         }
+        if (stored) {
+            s_last_seen_us[i] = esp_timer_get_time();
+        }
         break;
     }
     portEXIT_CRITICAL(&s_devices_mux);
@@ -304,6 +371,9 @@ void store_sensor_value(uint16_t short_address, uint8_t datapoint_id, uint32_t v
 size_t get_display_snapshot(std::array<DisplayRow, kMaxChildren>& rows)
 {
     size_t count = 0;
+    const int64_t now = esp_timer_get_time();
+    const int64_t stale_after_us =
+        static_cast<int64_t>(s_sensor_stale_after_minutes.load()) * 60 * 1000 * 1000;
     portENTER_CRITICAL(&s_devices_mux);
     for (size_t i = 0; i < s_devices.size() && count < rows.size(); ++i) {
         if (!s_devices[i].active) {
@@ -315,6 +385,8 @@ size_t get_display_snapshot(std::array<DisplayRow, kMaxChildren>& rows)
         row.name[sizeof(row.name) - 1] = '\0';
         row.short_address = s_devices[i].short_address;
         row.values = s_sensor_values[i];
+        row.stale = s_last_seen_us[i] > 0 &&
+                    now - s_last_seen_us[i] >= stale_after_us;
     }
     portEXIT_CRITICAL(&s_devices_mux);
 
@@ -341,6 +413,7 @@ bool display_snapshots_equal(const std::array<DisplayRow, kMaxChildren>& lhs,
         const SensorValues& b = rhs[i].values;
         if (lhs[i].short_address != rhs[i].short_address ||
             std::strcmp(lhs[i].name, rhs[i].name) != 0 ||
+            lhs[i].stale != rhs[i].stale ||
             a.soil_moisture != b.soil_moisture ||
             a.temperature_deci_c != b.temperature_deci_c ||
             a.battery_percent != b.battery_percent ||
@@ -629,7 +702,7 @@ lv_obj_t* create_display_label(lv_obj_t* parent, int x, int y, int width)
 {
     lv_obj_t* label = lv_label_create(parent);
     lv_obj_set_pos(label, x, y);
-    lv_obj_set_width(label, width);
+    lv_obj_set_size(label, width, 18);
     lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
     return label;
 }
@@ -644,13 +717,12 @@ void create_display_ui(DisplayLabels& labels)
 
     lv_obj_t* title = lv_label_create(screen);
     lv_label_set_text(title, "Plant sensor readings");
-    lv_obj_set_pos(title, 8, 5);
+    lv_obj_set_width(title, kDisplayWidth);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 4);
 
-    lv_obj_t* subtitle = lv_label_create(screen);
-    lv_label_set_text(subtitle, "Last received Zigbee values");
-    lv_obj_set_pos(subtitle, 8, 23);
-
-    const int column_y = 44;
+    const int column_y = 38;
     lv_obj_t* header = create_display_label(screen, 8, column_y, 145);
     lv_label_set_text(header, "Device");
     header = create_display_label(screen, 165, column_y, 48);
@@ -663,7 +735,7 @@ void create_display_ui(DisplayLabels& labels)
     lv_label_set_text(header, "Batt");
 
     lv_obj_t* divider = lv_obj_create(screen);
-    lv_obj_set_pos(divider, 8, 63);
+    lv_obj_set_pos(divider, 8, 57);
     lv_obj_set_size(divider, 384, 1);
     lv_obj_set_style_bg_color(divider, lv_color_black(), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(divider, LV_OPA_COVER, LV_PART_MAIN);
@@ -671,7 +743,15 @@ void create_display_ui(DisplayLabels& labels)
     lv_obj_remove_flag(divider, LV_OBJ_FLAG_SCROLLABLE);
 
     for (size_t i = 0; i < kMaxChildren; ++i) {
-        const int y = 69 + static_cast<int>(i) * 20;
+        const int y = 63 + static_cast<int>(i) * 20;
+        labels.row_background[i] = lv_obj_create(screen);
+        lv_obj_set_pos(labels.row_background[i], 8, y);
+        lv_obj_set_size(labels.row_background[i], 384, 18);
+        lv_obj_set_style_bg_color(labels.row_background[i], lv_color_black(), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(labels.row_background[i], LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_set_style_border_width(labels.row_background[i], 0, LV_PART_MAIN);
+        lv_obj_set_style_radius(labels.row_background[i], 0, LV_PART_MAIN);
+        lv_obj_remove_flag(labels.row_background[i], LV_OBJ_FLAG_SCROLLABLE);
         labels.device[i] = create_display_label(screen, 8, y, 145);
         labels.soil[i] = create_display_label(screen, 165, y, 48);
         labels.air[i] = create_display_label(screen, 218, y, 48);
@@ -692,6 +772,7 @@ void render_display_snapshot(const DisplayLabels& labels,
     lv_label_set_text(labels.empty_status, count == 0 ? "Waiting for joined sensors" : "");
     for (size_t i = 0; i < kMaxChildren; ++i) {
         if (i >= count) {
+            lv_obj_set_style_bg_opa(labels.row_background[i], LV_OPA_TRANSP, LV_PART_MAIN);
             lv_label_set_text(labels.device[i], "");
             lv_label_set_text(labels.soil[i], "");
             lv_label_set_text(labels.air[i], "");
@@ -701,6 +782,15 @@ void render_display_snapshot(const DisplayLabels& labels,
         }
 
         const DisplayRow& row = rows[i];
+        const lv_color_t text_color = row.stale ? lv_color_white() : lv_color_black();
+        lv_obj_set_style_bg_opa(labels.row_background[i],
+                                row.stale ? LV_OPA_COVER : LV_OPA_TRANSP,
+                                LV_PART_MAIN);
+        lv_obj_set_style_text_color(labels.device[i], text_color, LV_PART_MAIN);
+        lv_obj_set_style_text_color(labels.soil[i], text_color, LV_PART_MAIN);
+        lv_obj_set_style_text_color(labels.air[i], text_color, LV_PART_MAIN);
+        lv_obj_set_style_text_color(labels.temperature[i], text_color, LV_PART_MAIN);
+        lv_obj_set_style_text_color(labels.battery[i], text_color, LV_PART_MAIN);
         char soil[16]{};
         char air[16]{};
         char temperature[32]{};
@@ -1109,6 +1199,43 @@ void handle_rename_input(char* input)
     s_rename_stage = RenameStage::None;
 }
 
+void handle_timeout_command(char* argument)
+{
+    while (*argument == ' ' || *argument == '\t') {
+        ++argument;
+    }
+    size_t length = std::strlen(argument);
+    while (length > 0 && (argument[length - 1] == ' ' || argument[length - 1] == '\t')) {
+        argument[--length] = '\0';
+    }
+
+    if (length == 0) {
+        std::printf("Sensor timeout is %u minute(s).\n",
+                    static_cast<unsigned>(s_sensor_stale_after_minutes.load()));
+        return;
+    }
+
+    char* end = nullptr;
+    const long minutes = std::strtol(argument, &end, 10);
+    if (end == argument || *end != '\0' || minutes < 1 ||
+        minutes > kMaximumSensorStaleAfterMinutes) {
+        std::printf("Usage: Timeout [minutes] (1-%u; default %u).\n",
+                    static_cast<unsigned>(kMaximumSensorStaleAfterMinutes),
+                    static_cast<unsigned>(kDefaultSensorStaleAfterMinutes));
+        return;
+    }
+
+    const uint32_t new_timeout = static_cast<uint32_t>(minutes);
+    if (!save_sensor_timeout(new_timeout)) {
+        std::printf("Sensor timeout remains %u minute(s).\n",
+                    static_cast<unsigned>(s_sensor_stale_after_minutes.load()));
+        return;
+    }
+    s_sensor_stale_after_minutes.store(new_timeout);
+    std::printf("Sensor timeout set to %u minute(s) and saved.\n",
+                static_cast<unsigned>(new_timeout));
+}
+
 void handle_serial_command(char* command)
 {
     if (s_rename_stage != RenameStage::None) {
@@ -1116,7 +1243,10 @@ void handle_serial_command(char* command)
         return;
     }
 
-    if (strcasecmp(command, "Scan") == 0) {
+    if (strncasecmp(command, "Timeout", 7) == 0 &&
+        (command[7] == '\0' || command[7] == ' ' || command[7] == '\t')) {
+        handle_timeout_command(command + 7);
+    } else if (strcasecmp(command, "Scan") == 0) {
         if (!s_network_ready.load()) {
             std::printf("Network is not ready yet; try Scan again shortly.\n");
             return;
@@ -1147,7 +1277,7 @@ void handle_serial_command(char* command)
     } else if (strcasecmp(command, "Devices") == 0 || strcasecmp(command, "Rename") == 0) {
         start_device_rename();
     } else if (command[0] != '\0') {
-        std::printf("Unknown command. Use Scan, Stop, or Devices.\n");
+        std::printf("Unknown command. Use Scan, Stop, Devices, or Timeout [minutes].\n");
     }
 }
 
@@ -1157,7 +1287,7 @@ void serial_command_task(void*)
     size_t length = 0;
     bool discard_line = false;
     bool previous_was_carriage_return = false;
-    std::printf("Serial commands: Scan, Stop, Devices (list and rename)\n");
+    std::printf("Serial commands: Scan, Stop, Devices (list and rename), Timeout [minutes]\n");
 
     while (true) {
         const int input = std::getchar();
@@ -1232,6 +1362,7 @@ extern "C" void app_main(void)
 {
     ESP_ERROR_CHECK(nvs_flash_init());
     load_device_names();
+    load_sensor_timeout();
 
     if (xTaskCreate(zigbee_task, "zigbee", 6144, nullptr, 5, nullptr) != pdPASS) {
         ESP_LOGE(kTag, "Failed to create Zigbee task");
