@@ -170,7 +170,7 @@ bool save_device_names()
     nvs_handle_t handle;
     esp_err_t result = nvs_open(kNameNamespace, NVS_READWRITE, &handle);
     if (result != ESP_OK) {
-        ESP_LOGE(kTag, "Could not open device-name storage: %s", esp_err_to_name(result));
+        std::printf("Could not open device-name storage: %s\n", esp_err_to_name(result));
         return false;
     }
     result = nvs_set_blob(handle, kNameRecordsKey, names.data(), sizeof(names));
@@ -179,7 +179,7 @@ bool save_device_names()
     }
     nvs_close(handle);
     if (result != ESP_OK) {
-        ESP_LOGE(kTag, "Could not save device names: %s", esp_err_to_name(result));
+        std::printf("Could not save device names: %s\n", esp_err_to_name(result));
         return false;
     }
     return true;
@@ -1006,7 +1006,7 @@ bool zigbee_signal_handler(const ezb_app_signal_t* app_signal)
 void start_device_rename()
 {
     if (!s_network_ready.load()) {
-        ESP_LOGW(kTag, "Zigbee network is not ready yet");
+        std::printf("Zigbee network is not ready yet.\n");
         return;
     }
 
@@ -1024,19 +1024,19 @@ void start_device_rename()
     portEXIT_CRITICAL(&s_devices_mux);
 
     if (count == 0) {
-        ESP_LOGI(kTag, "No joined devices are currently visible");
+        std::printf("No joined devices are currently visible.\n");
         return;
     }
 
     s_selection_count = count;
-    ESP_LOGI(kTag, "Joined devices:");
+    std::printf("Joined devices:\n");
     for (size_t i = 0; i < count; ++i) {
         const char* name = snapshot[i].name[0] == '\0' ? "(unnamed)" : snapshot[i].name;
-        ESP_LOGI(kTag, "%u) %s - short 0x%04x, IEEE 0x%016llx",
+        std::printf("%u) %s - short 0x%04x, IEEE 0x%016llx\n",
                  static_cast<unsigned>(i + 1), name, snapshot[i].short_address,
                  static_cast<unsigned long long>(snapshot[i].ieee_address));
     }
-    ESP_LOGI(kTag, "Enter a device number to rename, or 0 to cancel:");
+    std::printf("Enter a device number to rename, or 0 to cancel:\n");
     s_rename_stage = RenameStage::ChooseDevice;
 }
 
@@ -1047,18 +1047,18 @@ void handle_rename_input(char* input)
         const long choice = std::strtol(input, &end, 10);
         if (end == input || *end != '\0' || choice < 0 ||
             static_cast<size_t>(choice) > s_selection_count) {
-            ESP_LOGW(kTag, "Invalid selection; rename cancelled");
+            std::printf("Invalid selection; rename cancelled.\n");
             s_rename_stage = RenameStage::None;
             return;
         }
         if (choice == 0) {
-            ESP_LOGI(kTag, "Rename cancelled");
+            std::printf("Rename cancelled.\n");
             s_rename_stage = RenameStage::None;
             return;
         }
         s_selected_device = s_selection[static_cast<size_t>(choice - 1)];
         s_rename_stage = RenameStage::EnterName;
-        ESP_LOGI(kTag, "Enter a name (up to %u characters), or leave blank to cancel:",
+        std::printf("Enter a name (up to %u characters), or leave blank to cancel:\n",
                  static_cast<unsigned>(kDeviceNameSize - 1));
         return;
     }
@@ -1076,12 +1076,12 @@ void handle_rename_input(char* input)
         name[--length] = '\0';
     }
     if (length == 0) {
-        ESP_LOGI(kTag, "Rename cancelled");
+        std::printf("Rename cancelled.\n");
         s_rename_stage = RenameStage::None;
         return;
     }
     if (length >= kDeviceNameSize) {
-        ESP_LOGW(kTag, "Name is too long; rename cancelled");
+        std::printf("Name is too long; rename cancelled.\n");
         s_rename_stage = RenameStage::None;
         return;
     }
@@ -1091,7 +1091,7 @@ void handle_rename_input(char* input)
     DeviceRecord& selected = s_devices[s_selected_device];
     if (!selected.active) {
         portEXIT_CRITICAL(&s_devices_mux);
-        ESP_LOGW(kTag, "Device is no longer joined; rename cancelled");
+        std::printf("Device is no longer joined; rename cancelled.\n");
         s_rename_stage = RenameStage::None;
         return;
     }
@@ -1100,7 +1100,7 @@ void handle_rename_input(char* input)
     portEXIT_CRITICAL(&s_devices_mux);
 
     if (save_device_names()) {
-        ESP_LOGI(kTag, "Device renamed to \"%s\"", name);
+        std::printf("Device renamed to \"%s\".\n", name);
     } else {
         portENTER_CRITICAL(&s_devices_mux);
         std::memcpy(s_devices[s_selected_device].name, previous_name, sizeof(previous_name));
@@ -1118,7 +1118,7 @@ void handle_serial_command(char* command)
 
     if (strcasecmp(command, "Scan") == 0) {
         if (!s_network_ready.load()) {
-            ESP_LOGW(kTag, "Network is not ready yet; try Scan again shortly");
+            std::printf("Network is not ready yet; try Scan again shortly.\n");
             return;
         }
 
@@ -1126,13 +1126,13 @@ void handle_serial_command(char* command)
         const ezb_err_t result = ezb_bdb_open_network(kJoinUntilClosed);
         esp_zigbee_lock_release();
         if (result == EZB_ERR_NONE) {
-            ESP_LOGI(kTag, "Network open for pairing until Stop is received");
+            std::printf("Network open for pairing until Stop is received.\n");
         } else {
-            ESP_LOGE(kTag, "Failed to open the network for pairing (error 0x%04x)", result);
+            std::printf("Failed to open the network for pairing (error 0x%04x).\n", result);
         }
     } else if (strcasecmp(command, "Stop") == 0) {
         if (!s_network_ready.load()) {
-            ESP_LOGW(kTag, "Network is not ready yet");
+            std::printf("Network is not ready yet.\n");
             return;
         }
 
@@ -1140,14 +1140,14 @@ void handle_serial_command(char* command)
         const ezb_err_t result = ezb_bdb_close_network();
         esp_zigbee_lock_release();
         if (result == EZB_ERR_NONE) {
-            ESP_LOGI(kTag, "Network closed to new pairings");
+            std::printf("Network closed to new pairings.\n");
         } else {
-            ESP_LOGE(kTag, "Failed to close the network (error 0x%04x)", result);
+            std::printf("Failed to close the network (error 0x%04x).\n", result);
         }
     } else if (strcasecmp(command, "Devices") == 0 || strcasecmp(command, "Rename") == 0) {
         start_device_rename();
     } else if (command[0] != '\0') {
-        ESP_LOGW(kTag, "Unknown command. Use Scan, Stop, or Devices");
+        std::printf("Unknown command. Use Scan, Stop, or Devices.\n");
     }
 }
 
@@ -1157,7 +1157,7 @@ void serial_command_task(void*)
     size_t length = 0;
     bool discard_line = false;
     bool previous_was_carriage_return = false;
-    ESP_LOGI(kTag, "Serial commands: Scan, Stop, Devices (list and rename)");
+    std::printf("Serial commands: Scan, Stop, Devices (list and rename)\n");
 
     while (true) {
         const int input = std::getchar();
@@ -1179,7 +1179,7 @@ void serial_command_task(void*)
                 line[length] = '\0';
                 handle_serial_command(line);
             } else {
-                ESP_LOGW(kTag, "Serial command too long; command discarded");
+                std::printf("Serial command too long; command discarded.\n");
             }
             length = 0;
             discard_line = false;
