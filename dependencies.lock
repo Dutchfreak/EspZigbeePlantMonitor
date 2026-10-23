@@ -13,9 +13,17 @@ dependencies:
     source:
       type: idf
     version: 6.1.0
+  lvgl/lvgl:
+    component_hash: 184e532558c1c45fefed631f3e235423d22582aafb4630f3e8885c35281a49ae
+    dependencies: []
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 9.5.0
 direct_dependencies:
 - espressif/esp-zigbee-lib
 - idf
-manifest_hash: d8dd5127b2e94465ecefeab6b192cf8876cbeeee4fda9f9c11df6a97f9d24bf4
+- lvgl/lvgl
+manifest_hash: 7bafad49239ffdecbc53b80f271e7db813f3435f93a8309b4a84ff7ab626963f
 target: esp32c6
 version: 3.0.0
