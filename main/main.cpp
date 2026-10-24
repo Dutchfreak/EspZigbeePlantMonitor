@@ -213,6 +213,31 @@ void select_external_antenna()
     ESP_ERROR_CHECK(gpio_set_level(kAntennaSelectPin, 1));
 }
 
+bool initialize_nvs()
+{
+    esp_err_t result = nvs_flash_init();
+    if (result == ESP_OK) {
+        return true;
+    }
+
+    ESP_LOGW(kTag, "NVS initialization failed (%s); erasing NVS and retrying",
+             esp_err_to_name(result));
+    result = nvs_flash_erase();
+    if (result != ESP_OK) {
+        ESP_LOGE(kTag, "Could not erase NVS: %s", esp_err_to_name(result));
+        return false;
+    }
+
+    result = nvs_flash_init();
+    if (result != ESP_OK) {
+        ESP_LOGE(kTag, "NVS initialization failed after erase: %s",
+                 esp_err_to_name(result));
+        return false;
+    }
+    ESP_LOGW(kTag, "NVS was erased; Zigbee network data and settings were reset");
+    return true;
+}
+
 bool save_device_names();
 
 void load_device_names()
@@ -245,12 +270,12 @@ void load_device_names()
         }
         for (PersistedNameRecord& record : s_persisted_names) {
             if (record.ieee_address == ieee_address) {
-                std::snprintf(record.name, sizeof(record.name), "%s", name);
+                std::memcpy(record.name, name, sizeof(record.name));
                 return;
             }
             if (record.ieee_address == 0) {
                 record.ieee_address = ieee_address;
-                std::snprintf(record.name, sizeof(record.name), "%s", name);
+                std::memcpy(record.name, name, sizeof(record.name));
                 return;
             }
         }
@@ -412,8 +437,8 @@ size_t find_or_add_device(uint64_t ieee_address, uint16_t short_address, bool ac
         s_rssi_valid[free_slot] = false;
         for (const PersistedNameRecord& record : s_persisted_names) {
             if (record.ieee_address == ieee_address) {
-                std::snprintf(s_devices[free_slot].name,
-                              sizeof(s_devices[free_slot].name), "%s", record.name);
+                std::memcpy(s_devices[free_slot].name, record.name,
+                            sizeof(s_devices[free_slot].name));
                 break;
             }
         }
@@ -437,17 +462,19 @@ void update_device_rssi(uint64_t ieee_address, int8_t rssi)
 
 void get_device_label(uint16_t short_address, char* label, size_t label_size)
 {
-    label[0] = '\0';
+    char device_name[kDeviceNameSize]{};
     portENTER_CRITICAL(&s_devices_mux);
     for (const DeviceRecord& device : s_devices) {
         if (device.active && device.short_address == short_address) {
-            std::snprintf(label, label_size, "%s", device.name);
+            std::memcpy(device_name, device.name, sizeof(device_name));
             break;
         }
     }
     portEXIT_CRITICAL(&s_devices_mux);
-    if (label[0] == '\0') {
+    if (device_name[0] == '\0') {
         std::snprintf(label, label_size, "Unnamed device");
+    } else {
+        std::snprintf(label, label_size, "%s", device_name);
     }
 }
 
@@ -481,7 +508,7 @@ void device_refresh_task(void*)
     vTaskDelete(nullptr);
 }
 
-void store_sensor_value(uint16_t short_address, uint8_t datapoint_id, uint32_t value)
+bool store_sensor_value(uint16_t short_address, uint8_t datapoint_id, uint32_t value)
 {
     bool stored = false;
     portENTER_CRITICAL(&s_devices_mux);
@@ -527,10 +554,8 @@ void store_sensor_value(uint16_t short_address, uint8_t datapoint_id, uint32_t v
                     datapoint_id == 15 || datapoint_id == 109)) {
         ESP_LOGW(kDisplayTag, "DP%u value %lu from short address 0x%04x not stored: device is not active",
                  datapoint_id, static_cast<unsigned long>(value), short_address);
-    } else if (stored) {
-        ESP_LOGI(kDisplayTag, "Stored latest DP%u value %lu for short address 0x%04x",
-                 datapoint_id, static_cast<unsigned long>(value), short_address);
     }
+    return stored;
 }
 
 size_t get_display_snapshot(std::array<DisplayRow, kMaxChildren>& rows)
@@ -1146,29 +1171,29 @@ bool handle_tuya_data_report(const ezb_zcl_raw_frame_t* raw_frame)
                                     (static_cast<uint32_t>(value[1]) << 16) |
                                     (static_cast<uint32_t>(value[2]) << 8) |
                                     static_cast<uint32_t>(value[3]);
-            store_sensor_value(source_short_address, datapoint_id, number);
-            // ESP_LOGI(kTag,"----------------------------------------");
-            // ESP_LOGI(kTag, "Tuya datapoint %u (type %u) with %zu bytes received from %s (0x%04x) Value: %lu",
-            //         datapoint_id, datapoint_type, value_length, device_name, source_short_address, static_cast<unsigned long>(number));
-            switch (datapoint_id) {
-            case 3:
-                ESP_LOGI(kTag, "%s (0x%04x) soil moisture: %lu %%", device_name,
-                         source_short_address, static_cast<unsigned long>(number));
-                break;
-            case 5:
-                ESP_LOGI(kTag, "%s (0x%04x) temperature: %.1f C", device_name,
-                         source_short_address, static_cast<double>(number) / 10.0);
-                break;
-            case 15:
-                ESP_LOGI(kTag, "%s (0x%04x) battery: %lu %%", device_name,
-                         source_short_address, static_cast<unsigned long>(number));
-                break;
-            case 109:
-                ESP_LOGI(kTag, "%s (0x%04x) air humidity: %lu %%", device_name,
-                         source_short_address, static_cast<unsigned long>(number));
-                break;
-            default:
-                break;
+            const bool stored =
+                store_sensor_value(source_short_address, datapoint_id, number);
+            if (stored) {
+                switch (datapoint_id) {
+                case 3:
+                    ESP_LOGI(kTag, "%s (0x%04x) soil moisture: %lu %%", device_name,
+                             source_short_address, static_cast<unsigned long>(number));
+                    break;
+                case 5:
+                    ESP_LOGI(kTag, "%s (0x%04x) temperature: %.1f C", device_name,
+                             source_short_address, static_cast<double>(number) / 10.0);
+                    break;
+                case 15:
+                    ESP_LOGI(kTag, "%s (0x%04x) battery: %lu %%", device_name,
+                             source_short_address, static_cast<unsigned long>(number));
+                    break;
+                case 109:
+                    ESP_LOGI(kTag, "%s (0x%04x) air humidity: %lu %%", device_name,
+                             source_short_address, static_cast<unsigned long>(number));
+                    break;
+                default:
+                    break;
+                }
             }
         }
         offset += value_length;
@@ -1338,12 +1363,12 @@ void list_devices()
             }
         }
         if (rssi_valid_snapshot[i]) {
-            std::printf("%u) %s - short 0x%04x, IEEE 0x%016llx, last heard: %s, RSSI: %d dBm\n",
+            std::printf("%u) %s - short 0x%04x, IEEE 0x%016llx, last heard: %s, last recorded RSSI: %d dBm\n",
                         static_cast<unsigned>(i + 1), name, snapshot[i].short_address,
                         static_cast<unsigned long long>(snapshot[i].ieee_address), last_heard,
                         static_cast<int>(rssi_snapshot[i]));
         } else {
-            std::printf("%u) %s - short 0x%04x, IEEE 0x%016llx, last heard: %s, RSSI: N/A\n",
+            std::printf("%u) %s - short 0x%04x, IEEE 0x%016llx, last heard: %s, last recorded RSSI: N/A\n",
                         static_cast<unsigned>(i + 1), name, snapshot[i].short_address,
                         static_cast<unsigned long long>(snapshot[i].ieee_address), last_heard);
         }
@@ -1479,6 +1504,8 @@ void handle_rename_input(char* input)
         return;
     }
 
+    char new_name[kDeviceNameSize]{};
+    std::memcpy(new_name, name, length + 1);
     char previous_name[kDeviceNameSize]{};
     PersistedNameRecord previous_record{};
     size_t name_slot = s_persisted_names.size();
@@ -1516,10 +1543,9 @@ void handle_rename_input(char* input)
     previous_record = s_persisted_names[name_slot];
     added_name_record = previous_record.ieee_address == 0;
     std::memcpy(previous_name, selected->name, sizeof(previous_name));
-    std::snprintf(selected->name, sizeof(selected->name), "%s", name);
+    std::memcpy(selected->name, new_name, sizeof(new_name));
     s_persisted_names[name_slot].ieee_address = s_selected_ieee_address;
-    std::snprintf(s_persisted_names[name_slot].name,
-                  sizeof(s_persisted_names[name_slot].name), "%s", name);
+    std::memcpy(s_persisted_names[name_slot].name, new_name, sizeof(new_name));
     portEXIT_CRITICAL(&s_devices_mux);
 
     if (save_device_names()) {
@@ -1733,7 +1759,9 @@ void zigbee_task(void*)
 
 extern "C" void app_main(void)
 {
-    ESP_ERROR_CHECK(nvs_flash_init());
+    if (!initialize_nvs()) {
+        return;
+    }
     select_external_antenna();
     load_device_names();
     load_sensor_timeout();
