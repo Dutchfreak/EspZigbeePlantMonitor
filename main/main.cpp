@@ -23,6 +23,7 @@ constexpr uint8_t kJoinUntilClosed = 0xFF;
 constexpr uint8_t kMaxChildren = 10;
 constexpr size_t kMaxKnownDevices = 16;
 constexpr size_t kDeviceNameSize = 32;
+constexpr uint32_t kPersistedNamesVersion = 1;
 constexpr uint16_t kTuyaClusterId = 0xEF00;
 constexpr uint8_t kTuyaDataReportCommand = 0x02;
 constexpr TickType_t kDisplayPollInterval = pdMS_TO_TICKS(1000);
@@ -32,6 +33,8 @@ constexpr uint32_t kMaximumSensorStaleAfterMinutes = 10080;
 constexpr char kDisplayTag[] = "epaper";
 constexpr char kNameNamespace[] = "zb_names";
 constexpr char kNameRecordsKey[] = "records";
+constexpr gpio_num_t kAntennaSwitchEnablePin = GPIO_NUM_3;
+constexpr gpio_num_t kAntennaSelectPin = GPIO_NUM_14;
 constexpr gpio_num_t kDisplayBusyPin = GPIO_NUM_21;
 constexpr gpio_num_t kDisplayResetPin = GPIO_NUM_22;
 constexpr gpio_num_t kDisplayDataCommandPin = GPIO_NUM_23;
@@ -79,7 +82,21 @@ struct DeviceRecord {
     char name[kDeviceNameSize]{};
 };
 
-using PersistedNames = std::array<DeviceRecord, kMaxKnownDevices>;
+struct PersistedNameRecord {
+    uint64_t ieee_address = 0;
+    char name[kDeviceNameSize]{};
+};
+
+struct PersistedNames {
+    uint32_t version = kPersistedNamesVersion;
+    uint32_t count = 0;
+    std::array<PersistedNameRecord, kMaxKnownDevices> records{};
+};
+
+using LegacyPersistedNames = std::array<DeviceRecord, kMaxKnownDevices>;
+static_assert(sizeof(PersistedNameRecord) == sizeof(uint64_t) + kDeviceNameSize);
+static_assert(sizeof(PersistedNames) == 2 * sizeof(uint32_t) +
+                                             kMaxKnownDevices * sizeof(PersistedNameRecord));
 
 struct SensorValues {
     uint32_t soil_moisture = 0;
@@ -117,21 +134,44 @@ bool s_display_io_failed = false;
 
 std::atomic<bool> s_network_ready{false};
 portMUX_TYPE s_devices_mux = portMUX_INITIALIZER_UNLOCKED;
-std::array<DeviceRecord, kMaxKnownDevices> s_devices{};
-std::array<SensorValues, kMaxKnownDevices> s_sensor_values{};
-std::array<int64_t, kMaxKnownDevices> s_last_seen_us{};
+std::array<DeviceRecord, kMaxChildren> s_devices{};
+std::array<SensorValues, kMaxChildren> s_sensor_values{};
+std::array<int64_t, kMaxChildren> s_last_seen_us{};
+std::array<int8_t, kMaxChildren> s_rssi{};
+std::array<bool, kMaxChildren> s_rssi_valid{};
+std::array<PersistedNameRecord, kMaxKnownDevices> s_persisted_names{};
 std::atomic<uint32_t> s_sensor_stale_after_minutes{kDefaultSensorStaleAfterMinutes};
 
 enum class RenameStage {
     None,
-    ChooseDevice,
     EnterName,
+    ConfirmRemove,
 };
 
 RenameStage s_rename_stage = RenameStage::None;
-std::array<size_t, kMaxKnownDevices> s_selection{};
+bool s_device_list_view = false;
+std::array<uint64_t, kMaxChildren> s_selection{};
 size_t s_selection_count = 0;
-size_t s_selected_device = 0;
+uint64_t s_selected_ieee_address = 0;
+
+void select_external_antenna()
+{
+    gpio_config_t enable_config{};
+    enable_config.pin_bit_mask = 1ULL << kAntennaSwitchEnablePin;
+    enable_config.mode = GPIO_MODE_OUTPUT;
+    ESP_ERROR_CHECK(gpio_config(&enable_config));
+    ESP_ERROR_CHECK(gpio_set_level(kAntennaSwitchEnablePin, 0));
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    gpio_config_t select_config{};
+    select_config.pin_bit_mask = 1ULL << kAntennaSelectPin;
+    select_config.mode = GPIO_MODE_OUTPUT;
+    ESP_ERROR_CHECK(gpio_config(&select_config));
+    ESP_ERROR_CHECK(gpio_set_level(kAntennaSelectPin, 1));
+}
+
+bool save_device_names();
 
 void load_device_names()
 {
@@ -140,27 +180,83 @@ void load_device_names()
     if (result == ESP_ERR_NVS_NOT_FOUND) {
         return;
     }
-    ESP_ERROR_CHECK(result);
-
-    PersistedNames names{};
-    size_t size = sizeof(names);
-    result = nvs_get_blob(handle, kNameRecordsKey, names.data(), &size);
-    nvs_close(handle);
-    if (result == ESP_ERR_NVS_NOT_FOUND) {
+    if (result != ESP_OK) {
+        std::printf("Could not open device-name storage: %s\n", esp_err_to_name(result));
         return;
     }
-    ESP_ERROR_CHECK(result);
-    ESP_ERROR_CHECK(size == sizeof(names) ? ESP_OK : ESP_ERR_INVALID_SIZE);
 
-    portENTER_CRITICAL(&s_devices_mux);
-    for (size_t i = 0; i < names.size(); ++i) {
-        if (names[i].ieee_address != 0) {
-            s_devices[i].ieee_address = names[i].ieee_address;
-            std::memcpy(s_devices[i].name, names[i].name, kDeviceNameSize);
-            s_devices[i].name[kDeviceNameSize - 1] = '\0';
-        }
+    size_t size = 0;
+    result = nvs_get_blob(handle, kNameRecordsKey, nullptr, &size);
+    if (result == ESP_ERR_NVS_NOT_FOUND) {
+        nvs_close(handle);
+        return;
     }
-    portEXIT_CRITICAL(&s_devices_mux);
+    if (result != ESP_OK) {
+        nvs_close(handle);
+        std::printf("Could not inspect device-name storage: %s\n", esp_err_to_name(result));
+        return;
+    }
+
+    auto import_name = [](uint64_t ieee_address, const char* name) {
+        if (ieee_address == 0 || name[0] == '\0') {
+            return;
+        }
+        for (PersistedNameRecord& record : s_persisted_names) {
+            if (record.ieee_address == ieee_address) {
+                std::snprintf(record.name, sizeof(record.name), "%s", name);
+                return;
+            }
+            if (record.ieee_address == 0) {
+                record.ieee_address = ieee_address;
+                std::snprintf(record.name, sizeof(record.name), "%s", name);
+                return;
+            }
+        }
+    };
+
+    bool migrate_legacy_names = false;
+    if (size == sizeof(LegacyPersistedNames)) {
+        LegacyPersistedNames legacy{};
+        size_t legacy_size = sizeof(legacy);
+        result = nvs_get_blob(handle, kNameRecordsKey, legacy.data(), &legacy_size);
+        if (result == ESP_OK && legacy_size == sizeof(legacy)) {
+            portENTER_CRITICAL(&s_devices_mux);
+            for (DeviceRecord& record : legacy) {
+                record.name[kDeviceNameSize - 1] = '\0';
+                import_name(record.ieee_address, record.name);
+            }
+            portEXIT_CRITICAL(&s_devices_mux);
+            migrate_legacy_names = true;
+        } else if (result == ESP_OK) {
+            result = ESP_ERR_INVALID_SIZE;
+        }
+    } else if (size == sizeof(PersistedNames)) {
+        PersistedNames names{};
+        size_t names_size = sizeof(names);
+        result = nvs_get_blob(handle, kNameRecordsKey, &names, &names_size);
+        if (result == ESP_OK && names_size == sizeof(names) &&
+            names.version == kPersistedNamesVersion &&
+            names.count <= names.records.size()) {
+            portENTER_CRITICAL(&s_devices_mux);
+            for (size_t i = 0; i < names.count; ++i) {
+                names.records[i].name[kDeviceNameSize - 1] = '\0';
+                import_name(names.records[i].ieee_address, names.records[i].name);
+            }
+            portEXIT_CRITICAL(&s_devices_mux);
+        } else if (result == ESP_OK) {
+            result = ESP_ERR_INVALID_SIZE;
+        }
+    } else {
+        result = ESP_ERR_INVALID_SIZE;
+    }
+    nvs_close(handle);
+
+    if (result != ESP_OK) {
+        std::printf("Device-name storage is invalid or unreadable: %s\n",
+                    esp_err_to_name(result));
+    } else if (migrate_legacy_names) {
+        (void)save_device_names();
+    }
 }
 
 void load_sensor_timeout()
@@ -219,9 +315,11 @@ bool save_device_names()
 {
     PersistedNames names{};
     portENTER_CRITICAL(&s_devices_mux);
-    for (size_t i = 0; i < s_devices.size(); ++i) {
-        names[i].ieee_address = s_devices[i].ieee_address;
-        std::memcpy(names[i].name, s_devices[i].name, kDeviceNameSize);
+    for (const PersistedNameRecord& record : s_persisted_names) {
+        if (record.ieee_address == 0 || record.name[0] == '\0') {
+            continue;
+        }
+        names.records[names.count++] = record;
     }
     portEXIT_CRITICAL(&s_devices_mux);
 
@@ -231,7 +329,7 @@ bool save_device_names()
         std::printf("Could not open device-name storage: %s\n", esp_err_to_name(result));
         return false;
     }
-    result = nvs_set_blob(handle, kNameRecordsKey, names.data(), sizeof(names));
+    result = nvs_set_blob(handle, kNameRecordsKey, &names, sizeof(names));
     if (result == ESP_OK) {
         result = nvs_commit(handle);
     }
@@ -245,32 +343,54 @@ bool save_device_names()
 
 size_t find_or_add_device(uint64_t ieee_address, uint16_t short_address, bool active)
 {
+    if (ieee_address == 0) {
+        return s_devices.size();
+    }
+
     size_t free_slot = s_devices.size();
     portENTER_CRITICAL(&s_devices_mux);
     for (size_t i = 0; i < s_devices.size(); ++i) {
-        if (s_devices[i].ieee_address == ieee_address) {
-            if (active && !s_devices[i].active && s_last_seen_us[i] == 0) {
-                s_last_seen_us[i] = esp_timer_get_time();
-            }
+        if (s_devices[i].active && s_devices[i].ieee_address == ieee_address) {
             s_devices[i].short_address = short_address;
             s_devices[i].active = active;
             portEXIT_CRITICAL(&s_devices_mux);
             return i;
         }
-        if (free_slot == s_devices.size() && s_devices[i].ieee_address == 0) {
+        if (free_slot == s_devices.size() && !s_devices[i].active) {
             free_slot = i;
         }
     }
-    if (free_slot < s_devices.size()) {
+    if (active && free_slot < s_devices.size()) {
         s_devices[free_slot].ieee_address = ieee_address;
         s_devices[free_slot].short_address = short_address;
         s_devices[free_slot].active = active;
-        if (active) {
-            s_last_seen_us[free_slot] = esp_timer_get_time();
+        s_sensor_values[free_slot] = SensorValues{};
+        s_last_seen_us[free_slot] = 0;
+        s_rssi[free_slot] = 0;
+        s_rssi_valid[free_slot] = false;
+        for (const PersistedNameRecord& record : s_persisted_names) {
+            if (record.ieee_address == ieee_address) {
+                std::snprintf(s_devices[free_slot].name,
+                              sizeof(s_devices[free_slot].name), "%s", record.name);
+                break;
+            }
         }
     }
     portEXIT_CRITICAL(&s_devices_mux);
     return free_slot;
+}
+
+void update_device_rssi(uint64_t ieee_address, int8_t rssi)
+{
+    portENTER_CRITICAL(&s_devices_mux);
+    for (size_t i = 0; i < s_devices.size(); ++i) {
+        if (s_devices[i].active && s_devices[i].ieee_address == ieee_address) {
+            s_rssi[i] = rssi;
+            s_rssi_valid[i] = true;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_devices_mux);
 }
 
 void get_device_label(uint16_t short_address, char* label, size_t label_size)
@@ -295,7 +415,10 @@ void refresh_neighbors()
     ezb_nwk_info_iterator_t iterator = EZB_NWK_INFO_ITERATOR_INIT;
     ezb_nwk_neighbor_info_t neighbor{};
     while (ezb_nwk_get_next_neighbor(&iterator, &neighbor) == EZB_ERR_NONE) {
-        find_or_add_device(neighbor.ieee_addr.u64, neighbor.short_addr, true);
+        if (find_or_add_device(neighbor.ieee_addr.u64, neighbor.short_addr, true) <
+            s_devices.size()) {
+            update_device_rssi(neighbor.ieee_addr.u64, neighbor.rssi);
+        }
     }
     esp_zigbee_lock_release();
 }
@@ -1064,10 +1187,13 @@ bool zigbee_signal_handler(const ezb_app_signal_t* app_signal)
             ezb_app_signal_get_params(app_signal));
         if (device != nullptr) {
             portENTER_CRITICAL(&s_devices_mux);
-            for (DeviceRecord& record : s_devices) {
-                if (record.ieee_address == device->device_addr.u64) {
-                    record.active = false;
-                    record.short_address = EZB_NWK_ADDR_UNKNOWN;
+            for (size_t i = 0; i < s_devices.size(); ++i) {
+                if (s_devices[i].ieee_address == device->device_addr.u64) {
+                    s_devices[i] = DeviceRecord{};
+                    s_sensor_values[i] = SensorValues{};
+                    s_last_seen_us[i] = 0;
+                    s_rssi[i] = 0;
+                    s_rssi_valid[i] = false;
                     break;
                 }
             }
@@ -1093,63 +1219,184 @@ bool zigbee_signal_handler(const ezb_app_signal_t* app_signal)
     return true;
 }
 
-void start_device_rename()
+void list_devices()
 {
     if (!s_network_ready.load()) {
         std::printf("Zigbee network is not ready yet.\n");
+        s_selection_count = 0;
+        std::printf("Device list commands: Rename <number>, Remove <number>\n");
         return;
     }
 
     refresh_neighbors();
 
-    std::array<DeviceRecord, kMaxKnownDevices> snapshot{};
+    std::array<DeviceRecord, kMaxChildren> snapshot{};
+    std::array<int64_t, kMaxChildren> last_seen_snapshot{};
+    std::array<int8_t, kMaxChildren> rssi_snapshot{};
+    std::array<bool, kMaxChildren> rssi_valid_snapshot{};
     size_t count = 0;
     portENTER_CRITICAL(&s_devices_mux);
     for (size_t i = 0; i < s_devices.size(); ++i) {
         if (s_devices[i].active) {
             snapshot[count] = s_devices[i];
-            s_selection[count++] = i;
+            last_seen_snapshot[count] = s_last_seen_us[i];
+            rssi_snapshot[count] = s_rssi[i];
+            rssi_valid_snapshot[count] = s_rssi_valid[i];
+            s_selection[count++] = s_devices[i].ieee_address;
         }
     }
     portEXIT_CRITICAL(&s_devices_mux);
 
+    s_selection_count = count;
     if (count == 0) {
         std::printf("No joined devices are currently visible.\n");
+        std::printf("Device list commands: Rename <number>, Remove <number>\n");
         return;
     }
 
-    s_selection_count = count;
     std::printf("Joined devices:\n");
+    const int64_t now = esp_timer_get_time();
     for (size_t i = 0; i < count; ++i) {
         const char* name = snapshot[i].name[0] == '\0' ? "(unnamed)" : snapshot[i].name;
-        std::printf("%u) %s - short 0x%04x, IEEE 0x%016llx\n",
-                 static_cast<unsigned>(i + 1), name, snapshot[i].short_address,
-                 static_cast<unsigned long long>(snapshot[i].ieee_address));
+        char last_heard[32]{};
+        if (last_seen_snapshot[i] == 0) {
+            std::snprintf(last_heard, sizeof(last_heard), "N/A");
+        } else {
+            const uint64_t elapsed_seconds =
+                static_cast<uint64_t>(now - last_seen_snapshot[i]) / 1000000;
+            if (elapsed_seconds < 60) {
+                std::snprintf(last_heard, sizeof(last_heard), "%llus ago",
+                              static_cast<unsigned long long>(elapsed_seconds));
+            } else if (elapsed_seconds < 60 * 60) {
+                std::snprintf(last_heard, sizeof(last_heard), "%llum %llus ago",
+                              static_cast<unsigned long long>(elapsed_seconds / 60),
+                              static_cast<unsigned long long>(elapsed_seconds % 60));
+            } else if (elapsed_seconds < 24 * 60 * 60) {
+                std::snprintf(last_heard, sizeof(last_heard), "%lluh %llum ago",
+                              static_cast<unsigned long long>(elapsed_seconds / 3600),
+                              static_cast<unsigned long long>((elapsed_seconds % 3600) / 60));
+            } else {
+                std::snprintf(last_heard, sizeof(last_heard), "%llud %lluh ago",
+                              static_cast<unsigned long long>(elapsed_seconds / 86400),
+                              static_cast<unsigned long long>((elapsed_seconds % 86400) / 3600));
+            }
+        }
+        if (rssi_valid_snapshot[i]) {
+            std::printf("%u) %s - short 0x%04x, IEEE 0x%016llx, last heard: %s, RSSI: %d dBm\n",
+                        static_cast<unsigned>(i + 1), name, snapshot[i].short_address,
+                        static_cast<unsigned long long>(snapshot[i].ieee_address), last_heard,
+                        static_cast<int>(rssi_snapshot[i]));
+        } else {
+            std::printf("%u) %s - short 0x%04x, IEEE 0x%016llx, last heard: %s, RSSI: N/A\n",
+                        static_cast<unsigned>(i + 1), name, snapshot[i].short_address,
+                        static_cast<unsigned long long>(snapshot[i].ieee_address), last_heard);
+        }
     }
-    std::printf("Enter a device number to rename, or 0 to cancel:\n");
-    s_rename_stage = RenameStage::ChooseDevice;
+    std::printf("Device list commands: Rename <number>, Remove <number>\n");
+}
+
+bool parse_device_number(char* argument, size_t& selection_index)
+{
+    while (*argument == ' ' || *argument == '\t') {
+        ++argument;
+    }
+    size_t length = std::strlen(argument);
+    while (length > 0 && (argument[length - 1] == ' ' || argument[length - 1] == '\t')) {
+        argument[--length] = '\0';
+    }
+
+    char* end = nullptr;
+    const long choice = std::strtol(argument, &end, 10);
+    if (length == 0 || end == argument || *end != '\0' || choice < 1 ||
+        static_cast<size_t>(choice) > s_selection_count) {
+        return false;
+    }
+    selection_index = static_cast<size_t>(choice - 1);
+    return true;
+}
+
+void return_to_device_list()
+{
+    s_rename_stage = RenameStage::None;
+    if (s_device_list_view) {
+        list_devices();
+    }
 }
 
 void handle_rename_input(char* input)
 {
-    if (s_rename_stage == RenameStage::ChooseDevice) {
-        char* end = nullptr;
-        const long choice = std::strtol(input, &end, 10);
-        if (end == input || *end != '\0' || choice < 0 ||
-            static_cast<size_t>(choice) > s_selection_count) {
-            std::printf("Invalid selection; rename cancelled.\n");
-            s_rename_stage = RenameStage::None;
+    if (s_rename_stage == RenameStage::ConfirmRemove) {
+        if (strcasecmp(input, "YES") != 0) {
+            std::printf("Remove cancelled.\n");
+            return_to_device_list();
             return;
         }
-        if (choice == 0) {
-            std::printf("Rename cancelled.\n");
-            s_rename_stage = RenameStage::None;
+
+        uint16_t short_address = EZB_NWK_ADDR_UNKNOWN;
+        size_t name_slot = s_persisted_names.size();
+        PersistedNameRecord previous_name{};
+        portENTER_CRITICAL(&s_devices_mux);
+        size_t device_slot = s_devices.size();
+        for (size_t i = 0; i < s_devices.size(); ++i) {
+            if (s_devices[i].active &&
+                s_devices[i].ieee_address == s_selected_ieee_address) {
+                device_slot = i;
+                short_address = s_devices[i].short_address;
+                break;
+            }
+        }
+        if (device_slot < s_devices.size()) {
+            for (size_t i = 0; i < s_persisted_names.size(); ++i) {
+                if (s_persisted_names[i].ieee_address == s_selected_ieee_address) {
+                    name_slot = i;
+                    previous_name = s_persisted_names[i];
+                    s_persisted_names[i] = PersistedNameRecord{};
+                    break;
+                }
+            }
+            s_devices[device_slot] = DeviceRecord{};
+            s_sensor_values[device_slot] = SensorValues{};
+            s_last_seen_us[device_slot] = 0;
+            s_rssi[device_slot] = 0;
+            s_rssi_valid[device_slot] = false;
+        }
+        portEXIT_CRITICAL(&s_devices_mux);
+
+        if (device_slot == s_devices.size()) {
+            std::printf("Device is no longer joined; removal cancelled.\n");
+            return_to_device_list();
             return;
         }
-        s_selected_device = s_selection[static_cast<size_t>(choice - 1)];
-        s_rename_stage = RenameStage::EnterName;
-        std::printf("Enter a name (up to %u characters), or leave blank to cancel:\n",
-                 static_cast<unsigned>(kDeviceNameSize - 1));
+
+        bool leave_request_queued = false;
+        if (s_network_ready.load() && short_address != EZB_NWK_ADDR_UNKNOWN) {
+            ezb_zdo_nwk_mgmt_leave_req_t request{};
+            request.dst_nwk_addr = short_address;
+            request.field.device_addr.u64 = s_selected_ieee_address;
+            request.field.remove_children = false;
+            request.field.rejoin = false;
+
+            esp_zigbee_lock_acquire(portMAX_DELAY);
+            const ezb_err_t result = ezb_zdo_nwk_mgmt_leave_req(&request);
+            esp_zigbee_lock_release();
+            leave_request_queued = result == EZB_ERR_NONE;
+            if (!leave_request_queued) {
+                std::printf("Could not request Zigbee leave (error 0x%04x).\n", result);
+            }
+        }
+
+        if (name_slot < s_persisted_names.size() && !save_device_names()) {
+            portENTER_CRITICAL(&s_devices_mux);
+            s_persisted_names[name_slot] = previous_name;
+            portEXIT_CRITICAL(&s_devices_mux);
+            std::printf("Device was removed locally, but its saved name could not be cleared.\n");
+        }
+        if (leave_request_queued) {
+            std::printf("Device removed locally; Zigbee leave request sent. The device may rejoin if it does not receive or honor the request.\n");
+        } else {
+            std::printf("Device removed from the local list. It may reappear if it remains on the Zigbee network.\n");
+        }
+        return_to_device_list();
         return;
     }
 
@@ -1167,36 +1414,75 @@ void handle_rename_input(char* input)
     }
     if (length == 0) {
         std::printf("Rename cancelled.\n");
-        s_rename_stage = RenameStage::None;
+        return_to_device_list();
         return;
     }
     if (length >= kDeviceNameSize) {
         std::printf("Name is too long; rename cancelled.\n");
-        s_rename_stage = RenameStage::None;
+        return_to_device_list();
         return;
     }
 
     char previous_name[kDeviceNameSize]{};
+    PersistedNameRecord previous_record{};
+    size_t name_slot = s_persisted_names.size();
+    bool added_name_record = false;
     portENTER_CRITICAL(&s_devices_mux);
-    DeviceRecord& selected = s_devices[s_selected_device];
-    if (!selected.active) {
+    DeviceRecord* selected = nullptr;
+    for (DeviceRecord& device : s_devices) {
+        if (device.active && device.ieee_address == s_selected_ieee_address) {
+            selected = &device;
+            break;
+        }
+    }
+    if (selected == nullptr) {
         portEXIT_CRITICAL(&s_devices_mux);
         std::printf("Device is no longer joined; rename cancelled.\n");
-        s_rename_stage = RenameStage::None;
+        return_to_device_list();
         return;
     }
-    std::memcpy(previous_name, selected.name, sizeof(previous_name));
-    std::snprintf(selected.name, sizeof(selected.name), "%s", name);
+    for (size_t i = 0; i < s_persisted_names.size(); ++i) {
+        if (s_persisted_names[i].ieee_address == s_selected_ieee_address) {
+            name_slot = i;
+            break;
+        }
+        if (name_slot == s_persisted_names.size() &&
+            s_persisted_names[i].ieee_address == 0) {
+            name_slot = i;
+        }
+    }
+    if (name_slot == s_persisted_names.size()) {
+        portEXIT_CRITICAL(&s_devices_mux);
+        std::printf("Saved-name storage is full; cannot rename this device.\n");
+        return_to_device_list();
+        return;
+    }
+    previous_record = s_persisted_names[name_slot];
+    added_name_record = previous_record.ieee_address == 0;
+    std::memcpy(previous_name, selected->name, sizeof(previous_name));
+    std::snprintf(selected->name, sizeof(selected->name), "%s", name);
+    s_persisted_names[name_slot].ieee_address = s_selected_ieee_address;
+    std::snprintf(s_persisted_names[name_slot].name,
+                  sizeof(s_persisted_names[name_slot].name), "%s", name);
     portEXIT_CRITICAL(&s_devices_mux);
 
     if (save_device_names()) {
         std::printf("Device renamed to \"%s\".\n", name);
     } else {
         portENTER_CRITICAL(&s_devices_mux);
-        std::memcpy(s_devices[s_selected_device].name, previous_name, sizeof(previous_name));
+        for (DeviceRecord& device : s_devices) {
+            if (device.active && device.ieee_address == s_selected_ieee_address) {
+                std::memcpy(device.name, previous_name, sizeof(previous_name));
+                break;
+            }
+        }
+        s_persisted_names[name_slot] = previous_record;
+        if (added_name_record) {
+            s_persisted_names[name_slot] = PersistedNameRecord{};
+        }
         portEXIT_CRITICAL(&s_devices_mux);
     }
-    s_rename_stage = RenameStage::None;
+    return_to_device_list();
 }
 
 void handle_timeout_command(char* argument)
@@ -1274,8 +1560,39 @@ void handle_serial_command(char* command)
         } else {
             std::printf("Failed to close the network (error 0x%04x).\n", result);
         }
-    } else if (strcasecmp(command, "Devices") == 0 || strcasecmp(command, "Rename") == 0) {
-        start_device_rename();
+    } else if (strcasecmp(command, "Devices") == 0) {
+        s_device_list_view = true;
+        list_devices();
+    } else if (strncasecmp(command, "Rename", 6) == 0 &&
+               (command[6] == '\0' || command[6] == ' ' || command[6] == '\t')) {
+        if (!s_device_list_view) {
+            std::printf("Run Devices first to view the device list.\n");
+            return;
+        }
+        size_t selection_index = 0;
+        if (!parse_device_number(command + 6, selection_index)) {
+            std::printf("Usage: Rename <device number>.\n");
+            return;
+        }
+        s_selected_ieee_address = s_selection[selection_index];
+        s_rename_stage = RenameStage::EnterName;
+        std::printf("Enter a name (up to %u characters), or leave blank to cancel:\n",
+                    static_cast<unsigned>(kDeviceNameSize - 1));
+    } else if (strncasecmp(command, "Remove", 6) == 0 &&
+               (command[6] == '\0' || command[6] == ' ' || command[6] == '\t')) {
+        if (!s_device_list_view) {
+            std::printf("Run Devices first to view the device list.\n");
+            return;
+        }
+        size_t selection_index = 0;
+        if (!parse_device_number(command + 6, selection_index)) {
+            std::printf("Usage: Remove <device number>.\n");
+            return;
+        }
+        s_selected_ieee_address = s_selection[selection_index];
+        s_rename_stage = RenameStage::ConfirmRemove;
+        std::printf("Remove device %u from the local list and request Zigbee leave? Type YES to confirm, or anything else to cancel:\n",
+                    static_cast<unsigned>(selection_index + 1));
     } else if (command[0] != '\0') {
         std::printf("Unknown command. Use Scan, Stop, Devices, or Timeout [minutes].\n");
     }
@@ -1287,7 +1604,7 @@ void serial_command_task(void*)
     size_t length = 0;
     bool discard_line = false;
     bool previous_was_carriage_return = false;
-    std::printf("Serial commands: Scan, Stop, Devices (list and rename), Timeout [minutes]\n");
+    std::printf("Serial commands: Scan, Stop, Devices, Timeout [minutes]\n");
 
     while (true) {
         const int input = std::getchar();
@@ -1361,6 +1678,7 @@ void zigbee_task(void*)
 extern "C" void app_main(void)
 {
     ESP_ERROR_CHECK(nvs_flash_init());
+    select_external_antenna();
     load_device_names();
     load_sensor_timeout();
 
