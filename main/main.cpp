@@ -15,6 +15,7 @@
 #include "freertos/task.h"
 #include "lvgl.h"
 #include "nvs_flash.h"
+#include "refresh_icons.h"
 
 namespace {
 
@@ -43,14 +44,8 @@ constexpr gpio_num_t kDisplayClockPin = GPIO_NUM_19;
 constexpr gpio_num_t kDisplayMosiPin = GPIO_NUM_18;
 constexpr uint16_t kDisplayWidth = 400;
 constexpr uint16_t kDisplayHeight = 300;
-constexpr size_t kRefreshIconSize = 16;
-constexpr size_t kRefreshIconFrameCount = 4;
-constexpr std::array<uint16_t, kRefreshIconSize> kRefreshIconRing{
-    0x03C0, 0x0C30, 0x1008, 0x2004, 0x4002, 0x4002, 0x8001, 0x8001,
-    0x8001, 0x8001, 0x4002, 0x4002, 0x2004, 0x1008, 0x0C30, 0x03C0};
 constexpr size_t kDisplayBytesPerRow = kDisplayWidth / 8;
 constexpr size_t kDisplayImageSize = kDisplayBytesPerRow * kDisplayHeight;
-constexpr size_t kRefreshIconBytes = kRefreshIconSize * kRefreshIconSize * sizeof(uint16_t);
 constexpr size_t kLvglPartialBufferBytes = kDisplayWidth * 10 * sizeof(uint16_t);
 constexpr int64_t kBusyTimeoutUs = 60 * 1000 * 1000;
 constexpr int64_t kBusyStartTimeoutUs = 5 * 1000 * 1000;
@@ -137,8 +132,6 @@ spi_device_handle_t s_display_spi = nullptr;
 alignas(4) std::array<uint8_t, kDisplayImageSize> s_display_image{};
 alignas(4) std::array<uint8_t, kDisplayImageSize> s_previous_display_image{};
 alignas(4) std::array<uint8_t, kLvglPartialBufferBytes> s_lvgl_partial_buffer{};
-std::array<std::array<uint8_t, kRefreshIconBytes>, kRefreshIconFrameCount> s_refresh_icon_data{};
-std::array<lv_image_dsc_t, kRefreshIconFrameCount> s_refresh_icon_descriptors{};
 bool s_display_io_failed = false;
 
 std::atomic<bool> s_network_ready{false};
@@ -162,39 +155,6 @@ bool s_device_list_view = false;
 std::array<uint64_t, kMaxChildren> s_selection{};
 size_t s_selection_count = 0;
 uint64_t s_selected_ieee_address = 0;
-
-void initialize_refresh_icons()
-{
-    constexpr std::array<int, kRefreshIconFrameCount> marker_x{6, 12, 6, 0};
-    constexpr std::array<int, kRefreshIconFrameCount> marker_y{0, 6, 12, 6};
-
-    for (size_t frame = 0; frame < kRefreshIconFrameCount; ++frame) {
-        auto& pixels = s_refresh_icon_data[frame];
-        for (size_t y = 0; y < kRefreshIconSize; ++y) {
-            for (size_t x = 0; x < kRefreshIconSize; ++x) {
-                const uint16_t mask = static_cast<uint16_t>(1U << (kRefreshIconSize - 1 - x));
-                const bool ring_pixel = (kRefreshIconRing[y] & mask) != 0;
-                const bool marker_pixel =
-                    static_cast<int>(x) >= marker_x[frame] &&
-                    static_cast<int>(x) < marker_x[frame] + 4 &&
-                    static_cast<int>(y) >= marker_y[frame] &&
-                    static_cast<int>(y) < marker_y[frame] + 4;
-                const uint16_t color = ring_pixel || marker_pixel ? 0x0000 : 0xFFFF;
-                const size_t offset = (y * kRefreshIconSize + x) * sizeof(color);
-                pixels[offset] = static_cast<uint8_t>(color & 0xFF);
-                pixels[offset + 1] = static_cast<uint8_t>(color >> 8);
-            }
-        }
-
-        lv_image_dsc_t& image = s_refresh_icon_descriptors[frame];
-        image.header.cf = LV_COLOR_FORMAT_RGB565;
-        image.header.w = kRefreshIconSize;
-        image.header.h = kRefreshIconSize;
-        image.header.stride = kRefreshIconSize * sizeof(uint16_t);
-        image.data_size = pixels.size();
-        image.data = pixels.data();
-    }
-}
 
 void select_external_antenna()
 {
@@ -913,7 +873,7 @@ void create_display_ui(DisplayLabels& labels)
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 4);
 
     labels.refresh_icon = lv_image_create(screen);
-    lv_obj_set_size(labels.refresh_icon, kRefreshIconSize, kRefreshIconSize);
+    lv_obj_set_size(labels.refresh_icon, refresh_icons::kSize, refresh_icons::kSize);
     lv_obj_align(labels.refresh_icon, LV_ALIGN_TOP_RIGHT, -8, 10);
 
     const int column_y = 38;
@@ -965,7 +925,7 @@ void render_display_snapshot(const DisplayLabels& labels,
 {
     ESP_LOGI(kDisplayTag, "Rendering %u active sensor row(s)", static_cast<unsigned>(count));
     lv_image_set_src(labels.refresh_icon,
-                     &s_refresh_icon_descriptors[refresh_indicator_frame]);
+                     refresh_icons::frame(refresh_indicator_frame));
     lv_label_set_text(labels.empty_status, count == 0 ? "Waiting for joined sensors" : "");
     for (size_t i = 0; i < kMaxChildren; ++i) {
         if (i >= count) {
@@ -1078,7 +1038,7 @@ void epaper_display_task(void*)
     ESP_LOGI(kDisplayTag, "LVGL display ready using 10-line RGB565 render buffer");
 
     DisplayLabels labels{};
-    initialize_refresh_icons();
+    refresh_icons::initialize();
     create_display_ui(labels);
     size_t refresh_indicator_frame = 0;
     std::array<DisplayRow, kMaxChildren> previous_rows{};
@@ -1093,7 +1053,7 @@ void epaper_display_task(void*)
         return;
     }
     refresh_indicator_frame =
-        (refresh_indicator_frame + 1) % kRefreshIconFrameCount;
+        (refresh_indicator_frame + 1) % refresh_icons::kFrameCount;
     TickType_t last_refresh = xTaskGetTickCount();
     ESP_LOGI(kDisplayTag, "Display ready; polling sensor values every %lu ms",
              static_cast<unsigned long>(kDisplayPollInterval * portTICK_PERIOD_MS));
@@ -1118,7 +1078,7 @@ void epaper_display_task(void*)
             previous_rows = current_rows;
             previous_count = current_count;
             refresh_indicator_frame =
-                (refresh_indicator_frame + 1) % kRefreshIconFrameCount;
+                (refresh_indicator_frame + 1) % refresh_icons::kFrameCount;
             last_refresh = xTaskGetTickCount();
         } else if (!display_snapshots_equal(previous_rows, previous_count, current_rows, current_count)) {
             ESP_LOGD(kDisplayTag, "Sensor values changed; waiting for refresh interval");
