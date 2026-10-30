@@ -29,13 +29,15 @@ namespace
     constexpr uint16_t kTuyaClusterId = 0xEF00;
     constexpr uint8_t kTuyaDataReportCommand = 0x02;
     constexpr TickType_t kDisplayPollInterval = pdMS_TO_TICKS(1000);
-    constexpr TickType_t kDisplayMinimumRefreshInterval = pdMS_TO_TICKS(15000);
+    constexpr uint32_t kDefaultDisplayRefreshMinutes = 1;
+    constexpr uint32_t kMaximumDisplayRefreshMinutes = 10080;
     constexpr uint32_t kDefaultSensorStaleAfterMinutes = 60;
     constexpr uint32_t kMaximumSensorStaleAfterMinutes = 10080;
     constexpr uint32_t kLowSoilMoistureThreshold = 20;
     constexpr char kDisplayTag[] = "epaper";
     constexpr char kNameNamespace[] = "zb_names";
     constexpr char kNameRecordsKey[] = "records";
+    constexpr char kDisplayRefreshMinutesKey[] = "refresh_mins";
     constexpr gpio_num_t kAntennaSwitchEnablePin = GPIO_NUM_3;
     constexpr gpio_num_t kAntennaSelectPin = GPIO_NUM_14;
     constexpr gpio_num_t kDisplayBusyPin = GPIO_NUM_21;
@@ -151,6 +153,7 @@ namespace
     std::array<bool, kMaxChildren> s_rssi_valid{};
     std::array<PersistedNameRecord, kMaxKnownDevices> s_persisted_names{};
     std::atomic<uint32_t> s_sensor_stale_after_minutes{kDefaultSensorStaleAfterMinutes};
+    std::atomic<uint32_t> s_display_refresh_minutes{kDefaultDisplayRefreshMinutes};
 
     enum class RenameStage
     {
@@ -378,6 +381,68 @@ namespace
         if (result != ESP_OK)
         {
             std::printf("Could not save sensor timeout: %s\n", esp_err_to_name(result));
+            return false;
+        }
+        return true;
+    }
+
+    void load_display_refresh_interval()
+    {
+        nvs_handle_t handle;
+        esp_err_t result = nvs_open(kNameNamespace, NVS_READONLY, &handle);
+        if (result == ESP_ERR_NVS_NOT_FOUND)
+        {
+            return;
+        }
+        if (result != ESP_OK)
+        {
+            std::printf("Could not open display-refresh storage: %s\n", esp_err_to_name(result));
+            return;
+        }
+
+        uint32_t minutes = kDefaultDisplayRefreshMinutes;
+        result = nvs_get_u32(handle, kDisplayRefreshMinutesKey, &minutes);
+        nvs_close(handle);
+        if (result == ESP_ERR_NVS_NOT_FOUND)
+        {
+            return;
+        }
+        if (result != ESP_OK)
+        {
+            std::printf("Could not load display refresh interval: %s\n",
+                        esp_err_to_name(result));
+            return;
+        }
+        if (minutes < 1 || minutes > kMaximumDisplayRefreshMinutes)
+        {
+            std::printf("Stored display refresh interval is invalid; using default %u minute(s).\n",
+                        static_cast<unsigned>(kDefaultDisplayRefreshMinutes));
+            return;
+        }
+
+        s_display_refresh_minutes.store(minutes);
+    }
+
+    bool save_display_refresh_interval(uint32_t minutes)
+    {
+        nvs_handle_t handle;
+        esp_err_t result = nvs_open(kNameNamespace, NVS_READWRITE, &handle);
+        if (result != ESP_OK)
+        {
+            std::printf("Could not open display-refresh storage: %s\n", esp_err_to_name(result));
+            return false;
+        }
+
+        result = nvs_set_u32(handle, kDisplayRefreshMinutesKey, minutes);
+        if (result == ESP_OK)
+        {
+            result = nvs_commit(handle);
+        }
+        nvs_close(handle);
+        if (result != ESP_OK)
+        {
+            std::printf("Could not save display refresh interval: %s\n",
+                        esp_err_to_name(result));
             return false;
         }
         return true;
@@ -1230,8 +1295,10 @@ namespace
             std::array<DisplayRow, kMaxChildren> current_rows{};
             const size_t current_count = get_display_snapshot(current_rows);
             const TickType_t now = xTaskGetTickCount();
+            const TickType_t minimum_refresh_interval = pdMS_TO_TICKS(
+                s_display_refresh_minutes.load() * 60U * 1000U);
             if (!display_snapshots_equal(previous_rows, previous_count, current_rows, current_count) &&
-                now - last_refresh >= kDisplayMinimumRefreshInterval)
+                now - last_refresh >= minimum_refresh_interval)
             {
                 render_display_snapshot(labels, current_rows, current_count,
                                         refresh_indicator_frame);
@@ -1822,6 +1889,48 @@ namespace
                     static_cast<unsigned>(new_timeout));
     }
 
+    void handle_refresh_command(char *argument)
+    {
+        while (*argument == ' ' || *argument == '\t')
+        {
+            ++argument;
+        }
+        size_t length = std::strlen(argument);
+        while (length > 0 && (argument[length - 1] == ' ' || argument[length - 1] == '\t'))
+        {
+            argument[--length] = '\0';
+        }
+
+        if (length == 0)
+        {
+            std::printf("Display refresh interval is %u minute(s).\n",
+                        static_cast<unsigned>(s_display_refresh_minutes.load()));
+            return;
+        }
+
+        char *end = nullptr;
+        const long minutes = std::strtol(argument, &end, 10);
+        if (end == argument || *end != '\0' || minutes < 1 ||
+            minutes > kMaximumDisplayRefreshMinutes)
+        {
+            std::printf("Usage: Refresh [minutes] (1-%u; default %u).\n",
+                        static_cast<unsigned>(kMaximumDisplayRefreshMinutes),
+                        static_cast<unsigned>(kDefaultDisplayRefreshMinutes));
+            return;
+        }
+
+        const uint32_t new_interval = static_cast<uint32_t>(minutes);
+        if (!save_display_refresh_interval(new_interval))
+        {
+            std::printf("Display refresh interval remains %u minute(s).\n",
+                        static_cast<unsigned>(s_display_refresh_minutes.load()));
+            return;
+        }
+        s_display_refresh_minutes.store(new_interval);
+        std::printf("Display refresh interval set to %u minute(s) and saved.\n",
+                    static_cast<unsigned>(new_interval));
+    }
+
     void handle_serial_command(char *command)
     {
         if (s_rename_stage != RenameStage::None)
@@ -1834,6 +1943,11 @@ namespace
             (command[7] == '\0' || command[7] == ' ' || command[7] == '\t'))
         {
             handle_timeout_command(command + 7);
+        }
+        else if (strncasecmp(command, "Refresh", 7) == 0 &&
+                 (command[7] == '\0' || command[7] == ' ' || command[7] == '\t'))
+        {
+            handle_refresh_command(command + 7);
         }
         else if (strcasecmp(command, "Scan") == 0)
         {
@@ -1920,7 +2034,7 @@ namespace
         }
         else if (command[0] != '\0')
         {
-            std::printf("Unknown command. Use Scan, Stop, Devices, or Timeout [minutes].\n");
+            std::printf("Unknown command. Use Scan, Stop, Devices, Timeout [minutes], or Refresh [minutes].\n");
         }
     }
 
@@ -1930,7 +2044,7 @@ namespace
         size_t length = 0;
         bool discard_line = false;
         bool previous_was_carriage_return = false;
-        std::printf("Serial commands: Scan, Stop, Devices, Timeout [minutes]\n");
+        std::printf("Serial commands: Scan, Stop, Devices, Timeout [minutes], Refresh [minutes]\n");
 
         while (true)
         {
@@ -2023,6 +2137,7 @@ extern "C" void app_main(void)
     select_external_antenna();
     load_device_names();
     load_sensor_timeout();
+    load_display_refresh_interval();
 
     if (xTaskCreate(zigbee_task, "zigbee", 6144, nullptr, 5, nullptr) != pdPASS)
     {
