@@ -30,7 +30,8 @@ display (400 × 300, IL0398 controller).
   - Battery (DP15)
   - Air humidity (DP109)
 - Displays joined sensors and their latest readings. A warning icon appears
-  beside soil moisture readings below 20%.
+  beside soil moisture readings below each device's configurable alert threshold
+  (20% by default).
 - Marks readings stale after a configurable timeout.
 - Lists devices with their last-heard time and last recorded RSSI; supports
   renaming and removing devices from the local list, with a Zigbee leave request.
@@ -147,6 +148,7 @@ Enter a command followed by Enter:
 | `Devices` | List joined devices, including last heard and last recorded RSSI. |
 | `Rename <number>` | Rename a device from the current `Devices` list. |
 | `Remove <number>` | Remove a device locally and ask it to leave the network. Confirm with `YES`. |
+| `Threshold <number> <percent>` | In the `Devices` list, set that device's soil alert threshold (0–100%; default 20%). Set to 0 to disable the alert. |
 | `Timeout` | Show the sensor stale timeout. |
 | `Timeout <minutes>` | Set and save the stale timeout (1–10,080 minutes; default 60). |
 | `Refresh` | Show the display refresh interval. |
@@ -156,7 +158,7 @@ The display updates when sensor or device data changes, subject to the configure
 minimum refresh interval. Since this is an e-paper display, frequent full
 refreshes can increase display wear and power use.
 
-Device names and timeout/refresh settings are stored in NVS. Zigbee network
-configuration is also stored there by the Zigbee stack. If NVS initialization
-fails at startup, the firmware erases NVS and retries; this resets the stored
-network and settings.
+Device names, per-device soil alert thresholds, and timeout/refresh settings
+are stored in NVS. Zigbee network configuration is also stored there by the
+Zigbee stack. If NVS initialization fails at startup, the firmware erases NVS
+and retries; this resets the stored network and settings.

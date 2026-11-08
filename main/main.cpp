@@ -26,6 +26,7 @@ namespace
     constexpr size_t kMaxKnownDevices = 16;
     constexpr size_t kDeviceNameSize = 32;
     constexpr uint32_t kPersistedNamesVersion = 1;
+    constexpr uint32_t kPersistedSoilAlertsVersion = 1;
     constexpr uint16_t kTuyaClusterId = 0xEF00;
     constexpr uint8_t kTuyaDataReportCommand = 0x02;
     constexpr TickType_t kDisplayPollInterval = pdMS_TO_TICKS(1000);
@@ -33,11 +34,12 @@ namespace
     constexpr uint32_t kMaximumDisplayRefreshMinutes = 10080;
     constexpr uint32_t kDefaultSensorStaleAfterMinutes = 60;
     constexpr uint32_t kMaximumSensorStaleAfterMinutes = 10080;
-    constexpr uint32_t kLowSoilMoistureThreshold = 20;
+    constexpr uint32_t kDefaultSoilAlertThresholdPercent = 20;
     constexpr char kDisplayTag[] = "epaper";
     constexpr char kNameNamespace[] = "zb_names";
     constexpr char kNameRecordsKey[] = "records";
     constexpr char kDisplayRefreshMinutesKey[] = "refresh_mins";
+    constexpr char kSoilAlertRecordsKey[] = "soil_alerts";
     constexpr gpio_num_t kAntennaSwitchEnablePin = GPIO_NUM_3;
     constexpr gpio_num_t kAntennaSelectPin = GPIO_NUM_14;
     constexpr gpio_num_t kDisplayBusyPin = GPIO_NUM_21;
@@ -100,10 +102,25 @@ namespace
         std::array<PersistedNameRecord, kMaxKnownDevices> records{};
     };
 
+    struct PersistedSoilAlertRecord
+    {
+        uint64_t ieee_address = 0;
+        uint32_t threshold_percent = kDefaultSoilAlertThresholdPercent;
+    };
+
+    struct PersistedSoilAlerts
+    {
+        uint32_t version = kPersistedSoilAlertsVersion;
+        uint32_t count = 0;
+        std::array<PersistedSoilAlertRecord, kMaxKnownDevices> records{};
+    };
+
     using LegacyPersistedNames = std::array<DeviceRecord, kMaxKnownDevices>;
     static_assert(sizeof(PersistedNameRecord) == sizeof(uint64_t) + kDeviceNameSize);
     static_assert(sizeof(PersistedNames) == 2 * sizeof(uint32_t) +
                                                 kMaxKnownDevices * sizeof(PersistedNameRecord));
+    static_assert(sizeof(PersistedSoilAlerts) == 2 * sizeof(uint32_t) +
+                                                       kMaxKnownDevices * sizeof(PersistedSoilAlertRecord));
 
     struct SensorValues
     {
@@ -122,6 +139,7 @@ namespace
         char name[kDeviceNameSize]{};
         uint16_t short_address = EZB_NWK_ADDR_UNKNOWN;
         SensorValues values{};
+        uint32_t soil_alert_threshold = kDefaultSoilAlertThresholdPercent;
         bool stale = false;
     };
 
@@ -152,6 +170,12 @@ namespace
     std::array<int8_t, kMaxChildren> s_rssi{};
     std::array<bool, kMaxChildren> s_rssi_valid{};
     std::array<PersistedNameRecord, kMaxKnownDevices> s_persisted_names{};
+    std::array<PersistedSoilAlertRecord, kMaxKnownDevices> s_persisted_soil_alerts{};
+    std::array<uint32_t, kMaxChildren> s_soil_alert_thresholds = [] {
+        std::array<uint32_t, kMaxChildren> thresholds{};
+        thresholds.fill(kDefaultSoilAlertThresholdPercent);
+        return thresholds;
+    }();
     std::atomic<uint32_t> s_sensor_stale_after_minutes{kDefaultSensorStaleAfterMinutes};
     std::atomic<uint32_t> s_display_refresh_minutes{kDefaultDisplayRefreshMinutes};
 
@@ -362,6 +386,212 @@ namespace
         s_sensor_stale_after_minutes.store(minutes);
     }
 
+    void load_soil_alert_thresholds()
+    {
+        nvs_handle_t handle;
+        esp_err_t result = nvs_open(kNameNamespace, NVS_READONLY, &handle);
+        if (result == ESP_ERR_NVS_NOT_FOUND)
+        {
+            return;
+        }
+        if (result != ESP_OK)
+        {
+            std::printf("Could not open soil-alert storage: %s\n", esp_err_to_name(result));
+            return;
+        }
+
+        size_t size = 0;
+        result = nvs_get_blob(handle, kSoilAlertRecordsKey, nullptr, &size);
+        if (result == ESP_ERR_NVS_NOT_FOUND)
+        {
+            nvs_close(handle);
+            return;
+        }
+        if (result != ESP_OK)
+        {
+            nvs_close(handle);
+            std::printf("Could not inspect soil-alert storage: %s\n", esp_err_to_name(result));
+            return;
+        }
+        if (size != sizeof(PersistedSoilAlerts))
+        {
+            nvs_close(handle);
+            std::printf("Stored soil-alert thresholds have an invalid size; using defaults.\n");
+            return;
+        }
+
+        PersistedSoilAlerts alerts{};
+        size_t alerts_size = sizeof(alerts);
+        result = nvs_get_blob(handle, kSoilAlertRecordsKey, &alerts, &alerts_size);
+        nvs_close(handle);
+        if (result != ESP_OK || alerts_size != sizeof(alerts) ||
+            alerts.version != kPersistedSoilAlertsVersion ||
+            alerts.count > alerts.records.size())
+        {
+            std::printf("Stored soil-alert thresholds are invalid; using defaults.\n");
+            return;
+        }
+
+        for (size_t i = 0; i < alerts.count; ++i)
+        {
+            if (alerts.records[i].ieee_address == 0 ||
+                alerts.records[i].threshold_percent > 100)
+            {
+                std::printf("Stored soil-alert thresholds are invalid; using defaults.\n");
+                return;
+            }
+            for (size_t j = 0; j < i; ++j)
+            {
+                if (alerts.records[i].ieee_address == alerts.records[j].ieee_address)
+                {
+                    std::printf("Stored soil-alert thresholds contain duplicate devices; using defaults.\n");
+                    return;
+                }
+            }
+        }
+
+        portENTER_CRITICAL(&s_devices_mux);
+        for (size_t i = 0; i < alerts.count; ++i)
+        {
+            s_persisted_soil_alerts[i] = alerts.records[i];
+        }
+        portEXIT_CRITICAL(&s_devices_mux);
+    }
+
+    bool save_soil_alert_thresholds()
+    {
+        PersistedSoilAlerts alerts{};
+        portENTER_CRITICAL(&s_devices_mux);
+        for (const PersistedSoilAlertRecord &record : s_persisted_soil_alerts)
+        {
+            if (record.ieee_address == 0)
+            {
+                continue;
+            }
+            alerts.records[alerts.count++] = record;
+        }
+        portEXIT_CRITICAL(&s_devices_mux);
+
+        nvs_handle_t handle;
+        esp_err_t result = nvs_open(kNameNamespace, NVS_READWRITE, &handle);
+        if (result != ESP_OK)
+        {
+            std::printf("Could not open soil-alert storage: %s\n", esp_err_to_name(result));
+            return false;
+        }
+        result = nvs_set_blob(handle, kSoilAlertRecordsKey, &alerts, sizeof(alerts));
+        if (result == ESP_OK)
+        {
+            result = nvs_commit(handle);
+        }
+        nvs_close(handle);
+        if (result != ESP_OK)
+        {
+            std::printf("Could not save soil-alert thresholds: %s\n", esp_err_to_name(result));
+            return false;
+        }
+        return true;
+    }
+
+    enum class SoilAlertUpdateResult
+    {
+        Updated,
+        DeviceNotFound,
+        StorageFull,
+        StorageError,
+    };
+
+    SoilAlertUpdateResult set_soil_alert_threshold(uint64_t ieee_address, uint32_t threshold)
+    {
+        size_t device_slot = s_devices.size();
+        size_t record_slot = s_persisted_soil_alerts.size();
+        PersistedSoilAlertRecord previous_record{};
+        uint32_t previous_threshold = kDefaultSoilAlertThresholdPercent;
+        bool had_record = false;
+
+        portENTER_CRITICAL(&s_devices_mux);
+        for (size_t i = 0; i < s_devices.size(); ++i)
+        {
+            if (s_devices[i].active && s_devices[i].ieee_address == ieee_address)
+            {
+                device_slot = i;
+                previous_threshold = s_soil_alert_thresholds[i];
+                break;
+            }
+        }
+        if (device_slot == s_devices.size())
+        {
+            portEXIT_CRITICAL(&s_devices_mux);
+            return SoilAlertUpdateResult::DeviceNotFound;
+        }
+
+        size_t free_slot = s_persisted_soil_alerts.size();
+        for (size_t i = 0; i < s_persisted_soil_alerts.size(); ++i)
+        {
+            if (s_persisted_soil_alerts[i].ieee_address == ieee_address)
+            {
+                record_slot = i;
+                had_record = true;
+                break;
+            }
+            if (free_slot == s_persisted_soil_alerts.size() &&
+                s_persisted_soil_alerts[i].ieee_address == 0)
+            {
+                free_slot = i;
+            }
+        }
+
+        if (threshold == kDefaultSoilAlertThresholdPercent)
+        {
+            if (!had_record)
+            {
+                s_soil_alert_thresholds[device_slot] = threshold;
+                portEXIT_CRITICAL(&s_devices_mux);
+                return SoilAlertUpdateResult::Updated;
+            }
+        }
+        else if (!had_record)
+        {
+            if (free_slot == s_persisted_soil_alerts.size())
+            {
+                portEXIT_CRITICAL(&s_devices_mux);
+                return SoilAlertUpdateResult::StorageFull;
+            }
+            record_slot = free_slot;
+        }
+
+        previous_record = s_persisted_soil_alerts[record_slot];
+        s_soil_alert_thresholds[device_slot] = threshold;
+        if (threshold == kDefaultSoilAlertThresholdPercent)
+        {
+            s_persisted_soil_alerts[record_slot] = PersistedSoilAlertRecord{};
+        }
+        else
+        {
+            s_persisted_soil_alerts[record_slot].ieee_address = ieee_address;
+            s_persisted_soil_alerts[record_slot].threshold_percent = threshold;
+        }
+        portEXIT_CRITICAL(&s_devices_mux);
+
+        if (save_soil_alert_thresholds())
+        {
+            return SoilAlertUpdateResult::Updated;
+        }
+
+        portENTER_CRITICAL(&s_devices_mux);
+        s_persisted_soil_alerts[record_slot] = previous_record;
+        for (size_t i = 0; i < s_devices.size(); ++i)
+        {
+            if (s_devices[i].active && s_devices[i].ieee_address == ieee_address)
+            {
+                s_soil_alert_thresholds[i] = previous_threshold;
+                break;
+            }
+        }
+        portEXIT_CRITICAL(&s_devices_mux);
+        return SoilAlertUpdateResult::StorageError;
+    }
+
     bool save_sensor_timeout(uint32_t minutes)
     {
         nvs_handle_t handle;
@@ -515,6 +745,15 @@ namespace
             s_last_seen_us[free_slot] = 0;
             s_rssi[free_slot] = 0;
             s_rssi_valid[free_slot] = false;
+            s_soil_alert_thresholds[free_slot] = kDefaultSoilAlertThresholdPercent;
+            for (const PersistedSoilAlertRecord &record : s_persisted_soil_alerts)
+            {
+                if (record.ieee_address == ieee_address)
+                {
+                    s_soil_alert_thresholds[free_slot] = record.threshold_percent;
+                    break;
+                }
+            }
             for (const PersistedNameRecord &record : s_persisted_names)
             {
                 if (record.ieee_address == ieee_address)
@@ -676,6 +915,7 @@ namespace
             row.name[sizeof(row.name) - 1] = '\0';
             row.short_address = s_devices[i].short_address;
             row.values = s_sensor_values[i];
+            row.soil_alert_threshold = s_soil_alert_thresholds[i];
             row.stale = s_last_seen_us[i] > 0 &&
                         now - s_last_seen_us[i] >= stale_after_us;
         }
@@ -708,6 +948,7 @@ namespace
             const SensorValues &b = rhs[i].values;
             if (lhs[i].short_address != rhs[i].short_address ||
                 std::strcmp(lhs[i].name, rhs[i].name) != 0 ||
+                lhs[i].soil_alert_threshold != rhs[i].soil_alert_threshold ||
                 lhs[i].stale != rhs[i].stale ||
                 a.soil_moisture != b.soil_moisture ||
                 a.temperature_deci_c != b.temperature_deci_c ||
@@ -1143,7 +1384,7 @@ namespace
             lv_obj_set_style_text_color(labels.battery[i], text_color, LV_PART_MAIN);
             const bool low_soil_moisture =
                 row.values.soil_moisture_valid &&
-                row.values.soil_moisture < kLowSoilMoistureThreshold;
+                row.values.soil_moisture < row.soil_alert_threshold;
             if (low_soil_moisture)
             {
                 lv_obj_remove_flag(labels.soil_warning[i], LV_OBJ_FLAG_HIDDEN);
@@ -1499,6 +1740,7 @@ namespace
                         s_last_seen_us[i] = 0;
                         s_rssi[i] = 0;
                         s_rssi_valid[i] = false;
+                        s_soil_alert_thresholds[i] = kDefaultSoilAlertThresholdPercent;
                         break;
                     }
                 }
@@ -1532,7 +1774,7 @@ namespace
         {
             std::printf("Zigbee network is not ready yet.\n");
             s_selection_count = 0;
-            std::printf("Device list commands: Rename <number>, Remove <number>\n");
+            std::printf("Device list commands: Rename <number>, Remove <number>, Threshold <number> <percent>\n");
             return;
         }
 
@@ -1542,6 +1784,7 @@ namespace
         std::array<int64_t, kMaxChildren> last_seen_snapshot{};
         std::array<int8_t, kMaxChildren> rssi_snapshot{};
         std::array<bool, kMaxChildren> rssi_valid_snapshot{};
+        std::array<uint32_t, kMaxChildren> soil_alert_snapshot{};
         size_t count = 0;
         portENTER_CRITICAL(&s_devices_mux);
         for (size_t i = 0; i < s_devices.size(); ++i)
@@ -1552,6 +1795,7 @@ namespace
                 last_seen_snapshot[count] = s_last_seen_us[i];
                 rssi_snapshot[count] = s_rssi[i];
                 rssi_valid_snapshot[count] = s_rssi_valid[i];
+                soil_alert_snapshot[count] = s_soil_alert_thresholds[i];
                 s_selection[count++] = s_devices[i].ieee_address;
             }
         }
@@ -1561,7 +1805,7 @@ namespace
         if (count == 0)
         {
             std::printf("No joined devices are currently visible.\n");
-            std::printf("Device list commands: Rename <number>, Remove <number>\n");
+            std::printf("Device list commands: Rename <number>, Remove <number>, Threshold <number> <percent>\n");
             return;
         }
 
@@ -1570,6 +1814,16 @@ namespace
         for (size_t i = 0; i < count; ++i)
         {
             const char *name = snapshot[i].name[0] == '\0' ? "(unnamed)" : snapshot[i].name;
+            char soil_alert[24]{};
+            if (soil_alert_snapshot[i] == 0)
+            {
+                std::snprintf(soil_alert, sizeof(soil_alert), "disabled");
+            }
+            else
+            {
+                std::snprintf(soil_alert, sizeof(soil_alert), "below %u%%",
+                              static_cast<unsigned>(soil_alert_snapshot[i]));
+            }
             char last_heard[32]{};
             if (last_seen_snapshot[i] == 0)
             {
@@ -1605,19 +1859,21 @@ namespace
             }
             if (rssi_valid_snapshot[i])
             {
-                std::printf("%u) %s - short 0x%04x, IEEE 0x%016llx, last heard: %s, last recorded RSSI: %d dBm\n",
+                std::printf("%u) %s - short 0x%04x, IEEE 0x%016llx, soil alert: %s, last heard: %s, last recorded RSSI: %d dBm\n",
                             static_cast<unsigned>(i + 1), name, snapshot[i].short_address,
-                            static_cast<unsigned long long>(snapshot[i].ieee_address), last_heard,
+                            static_cast<unsigned long long>(snapshot[i].ieee_address),
+                            soil_alert, last_heard,
                             static_cast<int>(rssi_snapshot[i]));
             }
             else
             {
-                std::printf("%u) %s - short 0x%04x, IEEE 0x%016llx, last heard: %s, last recorded RSSI: N/A\n",
+                std::printf("%u) %s - short 0x%04x, IEEE 0x%016llx, soil alert: %s, last heard: %s, last recorded RSSI: N/A\n",
                             static_cast<unsigned>(i + 1), name, snapshot[i].short_address,
-                            static_cast<unsigned long long>(snapshot[i].ieee_address), last_heard);
+                            static_cast<unsigned long long>(snapshot[i].ieee_address),
+                            soil_alert, last_heard);
             }
         }
-        std::printf("Device list commands: Rename <number>, Remove <number>\n");
+        std::printf("Device list commands: Rename <number>, Remove <number>, Threshold <number> <percent>\n");
     }
 
     bool parse_device_number(char *argument, size_t &selection_index)
@@ -1643,6 +1899,48 @@ namespace
         return true;
     }
 
+    bool parse_soil_threshold_command(char *argument,
+                                      size_t &selection_index,
+                                      uint32_t &threshold_percent)
+    {
+        while (*argument == ' ' || *argument == '\t')
+        {
+            ++argument;
+        }
+
+        char *end = nullptr;
+        const long device_number = std::strtol(argument, &end, 10);
+        if (end == argument || (*end != ' ' && *end != '\t'))
+        {
+            return false;
+        }
+
+        argument = end;
+        while (*argument == ' ' || *argument == '\t')
+        {
+            ++argument;
+        }
+
+        const long threshold = std::strtol(argument, &end, 10);
+        if (end == argument || threshold < 0 || threshold > 100)
+        {
+            return false;
+        }
+        while (*end == ' ' || *end == '\t')
+        {
+            ++end;
+        }
+        if (*end != '\0' || device_number < 1 ||
+            static_cast<size_t>(device_number) > s_selection_count)
+        {
+            return false;
+        }
+
+        selection_index = static_cast<size_t>(device_number - 1);
+        threshold_percent = static_cast<uint32_t>(threshold);
+        return true;
+    }
+
     void return_to_device_list()
     {
         s_rename_stage = RenameStage::None;
@@ -1665,7 +1963,10 @@ namespace
 
             uint16_t short_address = EZB_NWK_ADDR_UNKNOWN;
             size_t name_slot = s_persisted_names.size();
+            size_t soil_alert_slot = s_persisted_soil_alerts.size();
             PersistedNameRecord previous_name{};
+            PersistedSoilAlertRecord previous_soil_alert{};
+            uint32_t previous_soil_alert_threshold = kDefaultSoilAlertThresholdPercent;
             portENTER_CRITICAL(&s_devices_mux);
             size_t device_slot = s_devices.size();
             for (size_t i = 0; i < s_devices.size(); ++i)
@@ -1675,6 +1976,7 @@ namespace
                 {
                     device_slot = i;
                     short_address = s_devices[i].short_address;
+                    previous_soil_alert_threshold = s_soil_alert_thresholds[i];
                     break;
                 }
             }
@@ -1690,11 +1992,22 @@ namespace
                         break;
                     }
                 }
+                for (size_t i = 0; i < s_persisted_soil_alerts.size(); ++i)
+                {
+                    if (s_persisted_soil_alerts[i].ieee_address == s_selected_ieee_address)
+                    {
+                        soil_alert_slot = i;
+                        previous_soil_alert = s_persisted_soil_alerts[i];
+                        s_persisted_soil_alerts[i] = PersistedSoilAlertRecord{};
+                        break;
+                    }
+                }
                 s_devices[device_slot] = DeviceRecord{};
                 s_sensor_values[device_slot] = SensorValues{};
                 s_last_seen_us[device_slot] = 0;
                 s_rssi[device_slot] = 0;
                 s_rssi_valid[device_slot] = false;
+                s_soil_alert_thresholds[device_slot] = kDefaultSoilAlertThresholdPercent;
             }
             portEXIT_CRITICAL(&s_devices_mux);
 
@@ -1730,6 +2043,23 @@ namespace
                 s_persisted_names[name_slot] = previous_name;
                 portEXIT_CRITICAL(&s_devices_mux);
                 std::printf("Device was removed locally, but its saved name could not be cleared.\n");
+            }
+            if (soil_alert_slot < s_persisted_soil_alerts.size() &&
+                !save_soil_alert_thresholds())
+            {
+                portENTER_CRITICAL(&s_devices_mux);
+                s_persisted_soil_alerts[soil_alert_slot] = previous_soil_alert;
+                for (size_t i = 0; i < s_devices.size(); ++i)
+                {
+                    if (s_devices[i].active &&
+                        s_devices[i].ieee_address == s_selected_ieee_address)
+                    {
+                        s_soil_alert_thresholds[i] = previous_soil_alert_threshold;
+                        break;
+                    }
+                }
+                portEXIT_CRITICAL(&s_devices_mux);
+                std::printf("Device was removed locally, but its saved soil alert threshold could not be cleared.\n");
             }
             if (leave_request_queued)
             {
@@ -1994,6 +2324,47 @@ namespace
             s_device_list_view = true;
             list_devices();
         }
+        else if (strncasecmp(command, "Threshold", 9) == 0 &&
+                 (command[9] == '\0' || command[9] == ' ' || command[9] == '\t'))
+        {
+            if (!s_device_list_view)
+            {
+                std::printf("Run Devices first to view the device list.\n");
+                return;
+            }
+
+            size_t selection_index = 0;
+            uint32_t threshold_percent = 0;
+            if (!parse_soil_threshold_command(command + 9,
+                                              selection_index,
+                                              threshold_percent))
+            {
+                std::printf("Usage: Threshold <device number> <percent> (0-100; 0 disables the alert).\n");
+                return;
+            }
+
+            const SoilAlertUpdateResult result =
+                set_soil_alert_threshold(s_selection[selection_index], threshold_percent);
+            switch (result)
+            {
+            case SoilAlertUpdateResult::Updated:
+                std::printf("Soil alert threshold set to %u%% for device %u.\n",
+                            static_cast<unsigned>(threshold_percent),
+                            static_cast<unsigned>(selection_index + 1));
+                list_devices();
+                break;
+            case SoilAlertUpdateResult::DeviceNotFound:
+                std::printf("Device is no longer joined; threshold was not changed.\n");
+                list_devices();
+                break;
+            case SoilAlertUpdateResult::StorageFull:
+                std::printf("No more per-device soil thresholds can be saved.\n");
+                break;
+            case SoilAlertUpdateResult::StorageError:
+                std::printf("Soil alert threshold was not changed because saving failed.\n");
+                break;
+            }
+        }
         else if (strncasecmp(command, "Rename", 6) == 0 &&
                  (command[6] == '\0' || command[6] == ' ' || command[6] == '\t'))
         {
@@ -2034,7 +2405,7 @@ namespace
         }
         else if (command[0] != '\0')
         {
-            std::printf("Unknown command. Use Scan, Stop, Devices, Timeout [minutes], or Refresh [minutes].\n");
+            std::printf("Unknown command. Use Scan, Stop, Devices, Timeout [minutes], Refresh [minutes], or Threshold <number> <percent> in Devices.\n");
         }
     }
 
@@ -2138,6 +2509,7 @@ extern "C" void app_main(void)
     load_device_names();
     load_sensor_timeout();
     load_display_refresh_interval();
+    load_soil_alert_thresholds();
 
     if (xTaskCreate(zigbee_task, "zigbee", 6144, nullptr, 5, nullptr) != pdPASS)
     {
